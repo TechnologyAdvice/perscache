@@ -3,41 +3,89 @@
 Like `functools.lrucache`, but results can be saved in any format to any storage.
 """
 
+# Future Imports
+from __future__ import annotations
+
+# Standard Library Imports
+import asyncio as aio
 import datetime as dt
 import functools
-import hashlib
 import inspect
 
-import cloudpickle
+# Third-Party Imports
 from beartype import beartype
-from beartype.typing import Any, Callable, Iterable, Optional
+from beartype.typing import (
+    Any,
+    Callable,
+    Iterable,
+    Optional,
+)
 from icontract import require
 
-from .serializers import CloudPickleSerializer, Serializer
-from .storage import CacheExpired, LocalFileStorage, Storage
-from ._logger import debug, trace
+# Imports From Package Sub-Modules
+from ._logger import (
+    logger,
+    trace,
+)
+from .compatibility import (
+    AsyncCacheLock,
+    CachedCallable,
+    CachedValue,
+    CachedFunction,
+    CachedAsyncCallable,
+    hash_all,
+    is_async,
+)
+from .serializers import (
+    CloudPickleSerializer,
+    Serializer,
+)
+from .storage import (
+    CacheExpired,
+    LocalFileStorage,
+    Storage,
+)
 
 
-def hash_it(*data) -> str:
-    """Pickles and hashes all the data passed to it as args."""
-    result = hashlib.md5()  # nosec B303
-
-    for datum in data:
-        result.update(cloudpickle.dumps(datum))
-
-    return result.hexdigest()
+def valid_ttl(ttl: Optional[dt.timedelta] = None) -> bool:
+    """Checks if the supplied ttl value is valid (greater than 0 seconds)."""
+    return ttl is None or (isinstance(ttl, dt.timedelta) and ttl > dt.timedelta(seconds=0))
 
 
-def is_async(fn):
-    """Checks if the function is async."""
-    return inspect.iscoroutinefunction(fn) and not inspect.isgeneratorfunction(fn)
+def valid_ignores(self: "_CachedFunction", fn: CachedFunction) -> bool:
+    """Checks if any of the specified parameters to ignore are missing from the
+    supplied function's calling signature."""
+
+    ignored = set(self.ignore or tuple())
+    parameters = set(
+        inspect.signature(fn).parameters.keys(),
+    ).difference(("args", "kwargs"))
+
+    return ignored.issubset(parameters)
 
 
 class Cache:
     """A cache that can be used to memoize functions."""
 
+    __slots__ = (
+        "storage",
+        "hash_func",
+        "serializer",
+        "__locks_store__",
+    )
+
+    storage: Storage
+    serializer: Serializer
+    hash_func: Callable[..., str]
+    __locks_store__: Optional[dict[str, AsyncCacheLock]]
+
     @beartype
-    def __init__(self, serializer: Serializer = None, storage: Storage = None):
+    def __init__(
+        self,
+        serializer: Serializer = None,
+        storage: Storage = None,
+        hash_func: Optional[Callable[..., str]] = None,
+    ) -> None:
         """Initialize the cache.
 
         Args:
@@ -45,25 +93,48 @@ class Cache:
             storage: The storage to use. If not specified, LocalFileStorage is used.
         """
 
-        self.serializer = serializer or CloudPickleSerializer()
-        self.storage = storage or LocalFileStorage()
+        storage, serializer = (
+            (storage if storage is not None else LocalFileStorage()),
+            (serializer if serializer is not None else CloudPickleSerializer()),
+        )
+
+        if not isinstance(storage, Storage):
+            logger.warn(f"Unsupported storage backend: {storage!r}")
+            storage = LocalFileStorage()
+            logger.warn(f"Falling back to default storage: {storage!r}")
+
+        if not isinstance(serializer, Serializer):
+            logger.warn(f"Unsupported serializer: {serializer!r}")
+            serializer = CloudPickleSerializer()
+            logger.warn(f"Falling back to default serializer: {serializer!r}")
+
+        hash_func = hash_func or hash_all
+
+        if not callable(hash_func):
+            logger.warn(f"Unsupported hash function: {hash_func!r}")
+            hash_func = hash_all
+            logger.warn(f"Falling back to default hash function: {hash_func!r}")
+
+        self.storage, self.serializer, self.hash_func = (
+            storage,
+            serializer,
+            hash_func,
+        )
+        self.__locks_store__ = None
 
     def __repr__(self) -> str:
         return f"<Cache(serializer={self.serializer}, storage={self.storage})>"
 
     @beartype
-    @require(
-        lambda ttl: ttl is None or ttl > dt.timedelta(seconds=0),
-        "ttl must be positive.",
-    )
+    @require(valid_ttl, "ttl must be positive.")
     def __call__(
         self,
-        fn: Optional[Callable] = None,
+        fn: Optional[CachedFunction] = None,
         *,
-        ignore: Optional[Iterable[str]] = None,
-        serializer: Optional[Serializer] = None,
         storage: Optional[Storage] = None,
         ttl: Optional[dt.timedelta] = None,
+        ignore: Optional[Iterable[str]] = None,
+        serializer: Optional[Serializer] = None,
     ):
         """Cache the value of the wrapped function.
 
@@ -88,7 +159,11 @@ class Cache:
             ignore = [ignore]
 
         wrapper = _CachedFunction(
-            self, ignore, serializer or self.serializer, storage or self.storage, ttl
+            cache=self,
+            ttl=ttl,
+            ignore=ignore,
+            storage=storage or self.storage,
+            serializer=serializer or self.serializer,
         )
 
         # The decorator should work both with and without parentheses
@@ -99,35 +174,61 @@ class Cache:
     @staticmethod
     @trace
     def _get(
-        key: str, serializer: Serializer, storage: Storage, deadline: dt.datetime
-    ) -> Any:
+        key: str,
+        serializer: Serializer,
+        storage: Storage,
+        deadline: dt.datetime,
+    ) -> CachedValue:
+        """Get the specified key from the supplied storage."""
         data = storage.read(key, deadline)
         return serializer.loads(data)
 
     @staticmethod
     @trace
-    def _set(key: str, value: Any, serializer: Serializer, storage: Storage) -> None:
+    def _set(
+        key: str,
+        value: CachedValue,
+        serializer: Serializer,
+        storage: Storage,
+    ) -> None:
+        """Set the specified key to the supplied value in the supplied
+        storage."""
         data = serializer.dumps(value)
         storage.write(key, data)
 
-    @staticmethod
+    @property
+    def _async_locks(self) -> dict[str, AsyncCacheLock]:
+        """The cache instance's async lock store."""
+        locks = self.__locks_store__
+
+        if locks is None:
+            locks = self.__locks_store__ = dict()
+
+        return locks
+
     def _get_hash(
-        fn: Callable,
-        args: tuple,
-        kwargs: dict,
+        self,
+        fn: CachedFunction,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
         serializer: Serializer,
-        ignore: Iterable[str],
+        ignore: Iterable[str] = tuple(),
     ) -> str:
+        """Get the hash value for the supplied combination of function,
+        arguments, and serializer."""
+
+        ignore = ignore or tuple()
 
         # Remove ignored arguments from the arguments tuple and kwargs dict
-        arg_dict = inspect.signature(fn).bind(*args, **kwargs).arguments
+        fn_args = inspect.signature(fn).bind(*args, **kwargs).arguments
+        arg_dict = {arg: value for arg, value in fn_args.items() if arg not in ignore}
 
-        if ignore is not None:
-            arg_dict = {k: v for k, v in arg_dict.items() if k not in ignore}
+        fn_src, serializer_name = inspect.getsource(fn), type(serializer).__name__
 
-        return hash_it(inspect.getsource(fn), type(serializer).__name__, arg_dict)
+        return self.hash_func(fn_src, serializer_name, arg_dict)
 
-    def _get_filename(self, fn: Callable, key: str, serializer: Serializer) -> str:
+    @staticmethod
+    def _get_filename(fn: CachedFunction, key: str, serializer: Serializer) -> str:
         return f"{fn.__name__}-{key}.{serializer.extension}"
 
 
@@ -145,21 +246,20 @@ class NoCache:
     """
 
     def __repr__(self) -> str:
-        return "<NoCache>"
+        return f"<{type(self).__name__}>"
 
     @staticmethod
-    def __call__(*decorator_args, **decorator_kwargs):
-        """Will call the decorated function every time and
-        return its result without any caching.
-        """
+    def __call__(*decorator_args: Any, **decorator_kwargs: Any) -> CachedFunction:
+        """Will call the decorated function every time and return its result
+        without any caching."""
 
-        def _decorator(fn):
+        def _decorator(fn: CachedFunction):
             @functools.wraps(fn)
-            def _non_async_wrapper(*args, **kwargs):
+            def _non_async_wrapper(*args: Any, **kwargs: Any) -> CachedValue:
                 return fn(*args, **kwargs)
 
             @functools.wraps(fn)
-            async def _async_wrapper(*args, **kwargs):
+            async def _async_wrapper(*args: Any, **kwargs: Any) -> CachedValue:
                 return await fn(*args, **kwargs)
 
             return _async_wrapper if is_async(fn) else _non_async_wrapper
@@ -170,59 +270,147 @@ class NoCache:
 
 
 class _CachedFunction:
-    """An interal class used as a wrapper."""
+    """An internal class used as a wrapper."""
+
+    __slots__ = (
+        "ttl",
+        "cache",
+        "ignore",
+        "storage",
+        "serializer",
+    )
+
+    ttl: Optional[dt.timedelta]
+    cache: Cache
+    ignore: Optional[Iterable[str]]
+    storage: Storage
+    serializer: Serializer
 
     @beartype
     def __init__(
         self,
         cache: Cache,
-        ignore: Optional[Iterable[str]],
         serializer: Serializer,
         storage: Storage,
-        ttl: Optional[dt.timedelta],
+        ignore: Optional[Iterable[str]] = None,
+        ttl: Optional[dt.timedelta] = None,
     ):
+        self.ttl = ttl
         self.cache = cache
         self.ignore = ignore
-        self.serializer = serializer
         self.storage = storage
-        self.ttl = ttl
+        self.serializer = serializer
 
-    @require(
-        lambda self, fn: self.ignore is None
-        or all(x in inspect.signature(fn).parameters for x in self.ignore),
-        "Ignored parameters not found in the function signature.",
-    )
-    def __call__(self, fn: Callable) -> Callable:
+    @require(valid_ignores, "Ignored parameters not found in the function signature.")
+    def __call__(self, fn: CachedFunction) -> CachedFunction:
         """Return the correct wrapper."""
 
-        wrapper = self._async_wrapper if is_async(fn) else self._non_async_wrapper
-        return functools.update_wrapper(functools.partial(wrapper, fn), fn)
+        wrapper = self._wrapper if not is_async(fn) else self._async_wrapper
+        wrapped = functools.update_wrapper(functools.partial(wrapper, fn), fn)
 
-    def _non_async_wrapper(self, fn: Callable, *args, **kwargs):
-        debug("Getting cached result for function %s", fn.__name__)
-        key = self.cache._get_hash(fn, args, kwargs, self.serializer, self.ignore)
-        key = self.cache._get_filename(fn, key, self.serializer)
+        return wrapped
+
+    def _wrapper(
+        self,
+        fn: CachedCallable,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Callable[[CachedCallable], CachedCallable]:
+        fn_name = fn.__name__
+        hashed = self.cache._get_hash(
+            fn,
+            args,
+            kwargs,
+            self.serializer,
+            self.ignore,
+        )
+        cache_key = self.cache._get_filename(
+            fn,
+            hashed,
+            self.serializer,
+        )
+
+        logger.debug(f"Getting cached result for: {fn_name}")
+
         try:
-            return self.cache._get(key, self.serializer, self.storage, self.deadline)
-        except (FileNotFoundError, CacheExpired) as exception:
-            debug("Unable to get cached result for %s: %s", fn.__name__, exception)
+            value = self.cache._get(
+                cache_key,
+                self.serializer,
+                self.storage,
+                self.deadline,
+            )
+        except (EOFError, FileNotFoundError, CacheExpired) as exception:
+            logger.debug(f"Cache miss for <{fn_name}/{cache_key}>: {exception}")
+
             value = fn(*args, **kwargs)
-            self.cache._set(key, value, self.serializer, self.storage)
-            return value
 
-    async def _async_wrapper(self, fn: Callable, *args, **kwargs):
-        debug("Getting cached result for function %s", fn.__name__)
-        key = self.cache._get_hash(fn, args, kwargs, self.serializer, self.ignore)
-        key = self.cache._get_filename(fn, key, self.serializer)
-        try:
-            return self.cache._get(key, self.serializer, self.storage, self.deadline)
-        except (FileNotFoundError, CacheExpired) as exception:
-            debug("Unable to get cached result for %s: %s", fn.__name__, exception)
-            value = await fn(*args, **kwargs)
-            self.cache._set(key, value, self.serializer, self.storage)
-            return value
+            self.cache._set(
+                cache_key,
+                value,
+                self.serializer,
+                self.storage,
+            )
+
+        return value
 
     @property
-    def deadline(self) -> dt.datetime:
+    def _async_locks(self) -> dict[str, aio.Event]:
+        """The internal async lock store the function's associated cache
+        instance."""
+        return self.cache._async_locks
+
+    async def _async_wrapper(
+        self,
+        fn: CachedAsyncCallable,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Callable[[CachedAsyncCallable], CachedAsyncCallable]:
+        fn_name = fn.__name__
+        hashed = self.cache._get_hash(
+            fn,
+            args,
+            kwargs,
+            self.serializer,
+            self.ignore,
+        )
+        cache_key = self.cache._get_filename(
+            fn,
+            hashed,
+            self.serializer,
+        )
+        cache_lock = self._async_locks.get(cache_key)
+
+        if cache_lock is None:
+            fn_module = getattr(inspect.getmodule(fn), "__name__", None)
+            cache_lock = self._async_locks[cache_key] = AsyncCacheLock(
+                cache_key=cache_key,
+                fn_name=".".join(filter(None, (fn_module, fn_name))),
+            )
+
+        async with cache_lock:
+            try:
+                value = self.cache._get(
+                    cache_key,
+                    self.serializer,
+                    self.storage,
+                    self.deadline,
+                )
+            except (EOFError, FileNotFoundError, CacheExpired) as exception:
+                logger.debug(f"Cache miss for <{fn_name}/{cache_key}>: {exception}")
+
+                value = await fn(*args, **kwargs)
+
+                self.cache._set(
+                    cache_key,
+                    value,
+                    self.serializer,
+                    self.storage,
+                )
+
+        return value
+
+    @property
+    def deadline(self) -> Optional[dt.datetime]:
         """Return the deadline for the cache."""
-        return dt.datetime.now(dt.timezone.utc) - self.ttl if self.ttl else None
+        if self.ttl:
+            return dt.datetime.now(dt.timezone.utc) - self.ttl
