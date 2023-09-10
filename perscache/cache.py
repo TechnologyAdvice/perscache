@@ -19,8 +19,10 @@ from beartype.typing import (
     Callable,
     Iterable,
     Optional,
+    TypeVar,
 )
 from icontract import require
+import wrapt
 
 # Imports From Package Sub-Modules
 from ._logger import (
@@ -62,6 +64,9 @@ def valid_ignores(self: "_CachedFunction", fn: CachedFunction) -> bool:
     ).difference(("args", "kwargs"))
 
     return ignored.issubset(parameters)
+
+
+WrappedInstance = TypeVar("WrappedInstance")
 
 
 class Cache:
@@ -159,8 +164,8 @@ class Cache:
             ignore = [ignore]
 
         wrapper = _CachedFunction(
-            cache=self,
             ttl=ttl,
+            cache=self,
             ignore=ignore,
             storage=storage or self.storage,
             serializer=serializer or self.serializer,
@@ -213,15 +218,27 @@ class Cache:
         kwargs: dict[str, Any],
         serializer: Serializer,
         ignore: Iterable[str] = tuple(),
+        instance: Optional[WrappedInstance] = None,
     ) -> str:
         """Get the hash value for the supplied combination of function,
         arguments, and serializer."""
 
         ignore = ignore or tuple()
+        fn = getattr(fn, "__func__", fn)
+        instance = instance or WrappedInstance
+        args = args if instance is WrappedInstance else (instance, *args)
 
         # Remove ignored arguments from the arguments tuple and kwargs dict
-        fn_args = inspect.signature(fn).bind(*args, **kwargs).arguments
-        arg_dict = {arg: value for arg, value in fn_args.items() if arg not in ignore}
+        fn_sig = inspect.signature(fn)
+        fn_args = fn_sig.bind(*args, **kwargs).arguments
+        arg_dict = {
+            arg: id(value) if value is instance else value
+            for (
+                arg,
+                value,
+            ) in fn_args.items()
+            if arg not in ignore and value is not WrappedInstance
+        }
 
         fn_src, serializer_name = inspect.getsource(fn), type(serializer).__name__
 
@@ -302,27 +319,26 @@ class _CachedFunction:
         self.serializer = serializer
 
     @require(valid_ignores, "Ignored parameters not found in the function signature.")
-    def __call__(self, fn: CachedFunction) -> CachedFunction:
+    def __call__(self, fn: CachedFunction, *args: Any, **kwargs: Any) -> CachedFunction:
         """Return the correct wrapper."""
-
         wrapper = self._wrapper if not is_async(fn) else self._async_wrapper
-        wrapped = functools.update_wrapper(functools.partial(wrapper, fn), fn)
+        return wrapper(fn, *args, **kwargs)
 
-        return wrapped
-
+    @wrapt.decorator
     def _wrapper(
         self,
         fn: CachedCallable,
-        *args: Any,
-        **kwargs: Any,
+        instance: Optional[WrappedInstance],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
     ) -> Callable[[CachedCallable], CachedCallable]:
-        fn_name = fn.__name__
         hashed = self.cache._get_hash(
             fn,
-            args,
-            kwargs,
-            self.serializer,
-            self.ignore,
+            args=args,
+            kwargs=kwargs,
+            instance=instance,
+            ignore=self.ignore,
+            serializer=self.serializer,
         )
         cache_key = self.cache._get_filename(
             fn,
@@ -330,7 +346,10 @@ class _CachedFunction:
             self.serializer,
         )
 
+        fn_name = getattr(fn, "__qualname__", fn.__name__)
         logger.debug(f"Getting cached result for: {fn_name}")
+
+        args = args if instance is None else (instance, *args)
 
         try:
             value = self.cache._get(
@@ -359,19 +378,21 @@ class _CachedFunction:
         instance."""
         return self.cache._async_locks
 
+    @wrapt.decorator
     async def _async_wrapper(
         self,
         fn: CachedAsyncCallable,
-        *args: Any,
-        **kwargs: Any,
+        instance: Optional[WrappedInstance],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
     ) -> Callable[[CachedAsyncCallable], CachedAsyncCallable]:
-        fn_name = fn.__name__
         hashed = self.cache._get_hash(
             fn,
-            args,
-            kwargs,
-            self.serializer,
-            self.ignore,
+            args=args,
+            kwargs=kwargs,
+            instance=instance,
+            ignore=self.ignore,
+            serializer=self.serializer,
         )
         cache_key = self.cache._get_filename(
             fn,
@@ -379,6 +400,7 @@ class _CachedFunction:
             self.serializer,
         )
         cache_lock = self._async_locks.get(cache_key)
+        fn_name = getattr(fn, "__qualname__", fn.__name__)
 
         if cache_lock is None:
             fn_module = getattr(inspect.getmodule(fn), "__name__", None)
@@ -386,6 +408,8 @@ class _CachedFunction:
                 cache_key=cache_key,
                 fn_name=".".join(filter(None, (fn_module, fn_name))),
             )
+
+        args = args if instance is None else (instance, *args)
 
         async with cache_lock:
             try:
