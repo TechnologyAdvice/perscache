@@ -1,6 +1,9 @@
 """An easy to use decorator for persistent memoization.
 
+
+
 Like `functools.lrucache`, but results can be saved in any format to any storage.
+
 """
 
 # Future Imports
@@ -13,6 +16,7 @@ import functools
 import inspect
 
 # Third-Party Imports
+import wrapt
 from beartype import beartype
 from beartype.typing import (
     Any,
@@ -22,7 +26,6 @@ from beartype.typing import (
     TypeVar,
 )
 from icontract import require
-import wrapt
 
 # Imports From Package Sub-Modules
 from ._logger import (
@@ -31,10 +34,10 @@ from ._logger import (
 )
 from .compatibility import (
     AsyncCacheLock,
-    CachedCallable,
-    CachedValue,
-    CachedFunction,
     CachedAsyncCallable,
+    CachedCallable,
+    CachedFunction,
+    CachedValue,
     hash_all,
     is_async,
 )
@@ -59,11 +62,19 @@ def valid_ignores(self: "_CachedFunction", fn: CachedFunction) -> bool:
     supplied function's calling signature."""
 
     ignored = set(self.ignore or tuple())
-    parameters = set(
-        inspect.signature(fn).parameters.keys(),
-    ).difference(("args", "kwargs"))
+    parameters = dict(inspect.signature(fn).parameters)
+    variadic_params = {
+        parameters.pop(key)
+        for key, value in tuple(parameters.items())
+        if value.kind
+        in (
+            inspect.Parameter.VAR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+    }
+    valid = ignored.issubset(parameters)
 
-    return ignored.issubset(parameters)
+    return bool(valid or variadic_params)
 
 
 WrappedInstance = TypeVar("WrappedInstance")
@@ -107,19 +118,16 @@ class Cache:
             logger.warn(f"Unsupported storage backend: {storage!r}")
             storage = LocalFileStorage()
             logger.warn(f"Falling back to default storage: {storage!r}")
-
         if not isinstance(serializer, Serializer):
             logger.warn(f"Unsupported serializer: {serializer!r}")
             serializer = CloudPickleSerializer()
             logger.warn(f"Falling back to default serializer: {serializer!r}")
-
         hash_func = hash_func or hash_all
 
         if not callable(hash_func):
             logger.warn(f"Unsupported hash function: {hash_func!r}")
             hash_func = hash_all
             logger.warn(f"Falling back to default hash function: {hash_func!r}")
-
         self.storage, self.serializer, self.hash_func = (
             storage,
             serializer,
@@ -162,7 +170,6 @@ class Cache:
 
         if isinstance(ignore, str):
             ignore = [ignore]
-
         wrapper = _CachedFunction(
             ttl=ttl,
             cache=self,
@@ -208,7 +215,6 @@ class Cache:
 
         if locks is None:
             locks = self.__locks_store__ = dict()
-
         return locks
 
     def _get_hash(
@@ -369,7 +375,6 @@ class _CachedFunction:
                 self.serializer,
                 self.storage,
             )
-
         return value
 
     @property
@@ -408,7 +413,6 @@ class _CachedFunction:
                 cache_key=cache_key,
                 fn_name=".".join(filter(None, (fn_module, fn_name))),
             )
-
         args = args if instance is None else (instance, *args)
 
         async with cache_lock:
@@ -430,7 +434,6 @@ class _CachedFunction:
                     self.serializer,
                     self.storage,
                 )
-
         return value
 
     @property
