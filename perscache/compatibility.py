@@ -18,6 +18,7 @@ from types import TracebackType
 
 # Third-Party Imports
 import cloudpickle
+import cloudpickle.compat
 import pandas as pd
 from beartype.typing import (
     Optional,
@@ -68,6 +69,8 @@ md5_pattern: re.Pattern = re.compile(
     flags=re.I,
 )
 
+PicklingError = cloudpickle.compat.pickle.PicklingError
+
 # </editor-fold desc="# Constants ...">
 
 # <editor-fold desc="# Data Type Samples ...">
@@ -88,7 +91,9 @@ DATA_TYPES = {
         "NamedTuple",
         ("a", "b", "c"),
         module="perscache.data_types",
-    )(1, 2, 3),
+    )(
+        1, 2, 3  # noqa
+    ),
     # DATAFRAMES
     "dataframe_no_dates": pd.DataFrame(
         {
@@ -179,7 +184,10 @@ def hash_all(*data: Any) -> str:
     result = hashlib.md5()  # nosec B303
 
     for datum in data:
-        result.update(cloudpickle.dumps(datum))
+        try:
+            result.update(cloudpickle.dumps(datum))
+        except (TypeError, PicklingError):
+            pass
 
     return result.hexdigest()
 
