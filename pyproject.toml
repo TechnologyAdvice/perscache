@@ -40,12 +40,13 @@ beartype = ">=0.10.0"
 boltons = ">=23.0"
 cloudpickle = "*"
 icontract = "*"
+wrapt = "^1"
 
 # Optional Extras
-gcsfs = { version = "^2023.6", optional = true }
-pandas = { version = "^2.0", optional = true }
-pyarrow = { version = "^12.0", optional = true }
-pyyaml = { version = "^6.0", optional = true }
+gcsfs = { version = "^2023", optional = true }
+pandas = { version = "^2", optional = true }
+pyarrow = { version = "^13", optional = true }
+pyyaml = { version = "^6", optional = true }
 
 
 [tool.poetry.extras]
