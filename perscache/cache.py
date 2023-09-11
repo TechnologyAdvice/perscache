@@ -355,8 +355,6 @@ class _CachedFunction:
         fn_name = getattr(fn, "__qualname__", fn.__name__)
         logger.debug(f"Getting cached result for: {fn_name}")
 
-        args = args if instance is None else (instance, *args)
-
         try:
             value = self.cache._get(
                 cache_key,
@@ -413,7 +411,6 @@ class _CachedFunction:
                 cache_key=cache_key,
                 fn_name=".".join(filter(None, (fn_module, fn_name))),
             )
-        args = args if instance is None else (instance, *args)
 
         async with cache_lock:
             try:
