@@ -1,9 +1,6 @@
 """An easy to use decorator for persistent memoization.
 
-
-
 Like `functools.lrucache`, but results can be saved in any format to any storage.
-
 """
 
 # Future Imports
@@ -12,7 +9,6 @@ from __future__ import annotations
 # Standard Library Imports
 import asyncio as aio
 import datetime as dt
-import functools
 import inspect
 
 # Third-Party Imports
@@ -33,7 +29,6 @@ from ._logger import (
     trace,
 )
 from .compatibility import (
-    AsyncCacheLock,
     CachedAsyncCallable,
     CachedCallable,
     CachedFunction,
@@ -47,6 +42,7 @@ from .serializers import (
 )
 from .storage import (
     CacheExpired,
+    CacheMiss,
     LocalFileStorage,
     Storage,
 )
@@ -93,7 +89,7 @@ class Cache:
     storage: Storage
     serializer: Serializer
     hash_func: Callable[..., str]
-    __locks_store__: Optional[dict[str, AsyncCacheLock]]
+    __locks_store__: Optional[dict[str, aio.Future]]
 
     @beartype
     def __init__(
@@ -170,6 +166,7 @@ class Cache:
 
         if isinstance(ignore, str):
             ignore = [ignore]
+
         wrapper = _CachedFunction(
             ttl=ttl,
             cache=self,
@@ -192,8 +189,11 @@ class Cache:
         deadline: dt.datetime,
     ) -> CachedValue:
         """Get the specified key from the supplied storage."""
-        data = storage.read(key, deadline)
-        return serializer.loads(data)
+        try:
+            data = storage.read(key, deadline)
+            return serializer.loads(data)
+        except FileNotFoundError as error:
+            raise CacheMiss from error
 
     @staticmethod
     @trace
@@ -209,7 +209,7 @@ class Cache:
         storage.write(key, data)
 
     @property
-    def _async_locks(self) -> dict[str, AsyncCacheLock]:
+    def _async_locks(self) -> dict[str, aio.Future]:
         """The cache instance's async lock store."""
         locks = self.__locks_store__
 
@@ -268,28 +268,43 @@ class NoCache:
     ```
     """
 
+    @beartype
+    def __init__(self, *_: Any, **__: Any) -> None:
+        pass
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__}>"
 
-    @staticmethod
-    def __call__(*decorator_args: Any, **decorator_kwargs: Any) -> CachedFunction:
+    def __call__(self, *_: Any, **__: Any) -> CachedFunction:
         """Will call the decorated function every time and return its result
         without any caching."""
 
-        def _decorator(fn: CachedFunction):
-            @functools.wraps(fn)
-            def _non_async_wrapper(*args: Any, **kwargs: Any) -> CachedValue:
-                return fn(*args, **kwargs)
-
-            @functools.wraps(fn)
-            async def _async_wrapper(*args: Any, **kwargs: Any) -> CachedValue:
-                return await fn(*args, **kwargs)
-
-            return _async_wrapper if is_async(fn) else _non_async_wrapper
+        def _decorator(fn: CachedFunction) -> CachedCallable | CachedAsyncCallable:
+            return self._async_wrapper if is_async(fn) else self._wrapper
 
         return _decorator
 
     cache = __call__  # Alias for backwards compatibility.
+
+    @wrapt.decorator
+    def _wrapper(
+        self,
+        fn: CachedCallable,
+        _: Optional[WrappedInstance],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Callable[[CachedCallable], CachedCallable]:
+        return fn(*args, **kwargs)
+
+    @wrapt.decorator
+    async def _async_wrapper(
+        self,
+        fn: CachedAsyncCallable,
+        _: Optional[WrappedInstance],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Callable[[CachedAsyncCallable], CachedAsyncCallable]:
+        return await fn(*args, **kwargs)
 
 
 class _CachedFunction:
@@ -376,7 +391,7 @@ class _CachedFunction:
         return value
 
     @property
-    def _async_locks(self) -> dict[str, aio.Event]:
+    def _async_locks(self) -> dict[str, aio.Future]:
         """The internal async lock store the function's associated cache
         instance."""
         return self.cache._async_locks
@@ -402,35 +417,52 @@ class _CachedFunction:
             hashed,
             self.serializer,
         )
-        cache_lock = self._async_locks.get(cache_key)
-        fn_name = getattr(fn, "__qualname__", fn.__name__)
 
-        if cache_lock is None:
-            fn_module = getattr(inspect.getmodule(fn), "__name__", None)
-            cache_lock = self._async_locks[cache_key] = AsyncCacheLock(
-                cache_key=cache_key,
-                fn_name=".".join(filter(None, (fn_module, fn_name))),
+        fn_base_name = getattr(fn, "__qualname__", fn.__name__)
+        fn_module = getattr(inspect.getmodule(fn), "__name__", None)
+        fn_name = ".".join(filter(None, (fn_module, fn_base_name)))
+        lock_key = f"{fn_name}::{hashed}"
+
+        cache_lock: Optional[aio.Future] = self._async_locks.get(lock_key)
+
+        if cache_lock is None or cache_lock.done():
+            cache_lock = self._async_locks[lock_key] = aio.get_running_loop().create_future()
+            logger.debug(f"Cache lock acquired: <{fn_base_name}/{hashed}>")
+        else:
+            logger.debug(f"Waiting for outstanding cache lock: <{fn_base_name}/{hashed}>")
+            await cache_lock
+
+        try:
+            value = self.cache._get(
+                cache_key,
+                self.serializer,
+                self.storage,
+                self.deadline,
+            )
+        except (CacheMiss, CacheExpired) as exception:
+            log_prefix = (
+                "Cache miss"
+                if isinstance(exception, CacheMiss)
+                else "Cached data expired"
+                if isinstance(exception, CacheExpired)
+                else "Cache error"
+            )
+            logger.debug(f"{log_prefix} for <{fn_base_name}/{hashed}>: {exception}")
+
+            value = await fn(*args, **kwargs)
+
+            self.cache._set(
+                cache_key,
+                value,
+                self.serializer,
+                self.storage,
             )
 
-        async with cache_lock:
-            try:
-                value = self.cache._get(
-                    cache_key,
-                    self.serializer,
-                    self.storage,
-                    self.deadline,
-                )
-            except (EOFError, FileNotFoundError, CacheExpired) as exception:
-                logger.debug(f"Cache miss for <{fn_name}/{cache_key}>: {exception}")
+        if not cache_lock.done():
+            cache_lock.set_result(True)
+            del self._async_locks[lock_key]
+            logger.debug(f"Cache lock released: <{fn_base_name}/{hashed}>")
 
-                value = await fn(*args, **kwargs)
-
-                self.cache._set(
-                    cache_key,
-                    value,
-                    self.serializer,
-                    self.storage,
-                )
         return value
 
     @property
