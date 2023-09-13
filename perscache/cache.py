@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio as aio
 import datetime as dt
 import inspect
+from functools import partial
 
 # Third-Party Imports
 import wrapt
@@ -114,22 +115,25 @@ class Cache:
             logger.warn(f"Unsupported storage backend: {storage!r}")
             storage = LocalFileStorage()
             logger.warn(f"Falling back to default storage: {storage!r}")
+
         if not isinstance(serializer, Serializer):
             logger.warn(f"Unsupported serializer: {serializer!r}")
             serializer = CloudPickleSerializer()
             logger.warn(f"Falling back to default serializer: {serializer!r}")
+
         hash_func = hash_func or hash_all
 
         if not callable(hash_func):
             logger.warn(f"Unsupported hash function: {hash_func!r}")
             hash_func = hash_all
             logger.warn(f"Falling back to default hash function: {hash_func!r}")
+
+        self.__locks_store__ = None
         self.storage, self.serializer, self.hash_func = (
             storage,
             serializer,
             hash_func,
         )
-        self.__locks_store__ = None
 
     def __repr__(self) -> str:
         return f"<Cache(serializer={self.serializer}, storage={self.storage})>"
@@ -238,12 +242,12 @@ class Cache:
         fn_sig = inspect.signature(fn)
         fn_args = fn_sig.bind(*args, **kwargs).arguments
         arg_dict = {
-            arg: id(value) if value is instance else value
+            arg: value
             for (
                 arg,
                 value,
             ) in fn_args.items()
-            if arg not in ignore and value is not WrappedInstance
+            if arg not in ignore and value not in (instance, WrappedInstance)
         }
 
         fn_src, serializer_name = inspect.getsource(fn), type(serializer).__name__
@@ -343,7 +347,8 @@ class _CachedFunction:
     def __call__(self, fn: CachedFunction, *args: Any, **kwargs: Any) -> CachedFunction:
         """Return the correct wrapper."""
         wrapper = self._wrapper if not is_async(fn) else self._async_wrapper
-        return wrapper(fn, *args, **kwargs)
+        wrapped = wrapper(fn, *args, **kwargs)
+        return wrapped
 
     @wrapt.decorator
     def _wrapper(
@@ -368,7 +373,7 @@ class _CachedFunction:
         )
 
         fn_name = getattr(fn, "__qualname__", fn.__name__)
-        logger.debug(f"Getting cached result for: {fn_name}")
+        logger.debug(f"Getting cached result for: <{fn_name}/{hashed}>")
 
         try:
             value = self.cache._get(
@@ -377,8 +382,15 @@ class _CachedFunction:
                 self.storage,
                 self.deadline,
             )
-        except (EOFError, FileNotFoundError, CacheExpired) as exception:
-            logger.debug(f"Cache miss for <{fn_name}/{cache_key}>: {exception}")
+        except (CacheMiss, CacheExpired) as exception:
+            log_prefix = (
+                "Cache miss"
+                if isinstance(exception, CacheMiss)
+                else "Cached data expired"
+                if isinstance(exception, CacheExpired)
+                else "Cache error"
+            )
+            logger.debug(f"{log_prefix} for <{fn_name}/{hashed}>: {exception}")
 
             value = fn(*args, **kwargs)
 
