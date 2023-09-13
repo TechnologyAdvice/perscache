@@ -7,13 +7,18 @@ from __future__ import annotations
 import datetime as dt
 import pickle
 import shelve
+import sys
 import tempfile
 from abc import (
     ABC,
     abstractmethod,
 )
 from collections import namedtuple
-from functools import cache as memoize
+from functools import (
+    cache as memoize,
+    cached_property as memoized_property,
+    reduce,
+)
 from pathlib import Path
 
 # Third-Party Imports
@@ -24,6 +29,7 @@ from beartype.typing import (
     Iterator,
     Optional,
     Union,
+    cast,
 )
 
 # Imports From Package Sub-Modules
@@ -93,10 +99,7 @@ class Storage(ABC):
     @memoize
     def _resolve_path(path: Optional[PathLike]) -> Path:
         """Ensure the specified path points to a valid directory."""
-        path = Path(path or DefaultTempDir)
-
-        if not path.is_absolute():
-            path = DefaultTempDir / str(path)
+        path = Path(path or DefaultTempDir).resolve()
 
         target_path = path
 
@@ -117,10 +120,12 @@ class ShelvedStorage(Storage):
 
     __slots__ = (
         "_max_size",
+        "_strategy",
         "_shelf_path",
     )
 
     _max_size: Optional[int]
+    _strategy: str
     _shelf_path: Path
 
     @beartype
@@ -128,27 +133,66 @@ class ShelvedStorage(Storage):
         self,
         location: Optional[PathLike] = None,
         max_size: Optional[int] = None,
+        always_fresh: bool = True,
+        eviction_strategy: Optional[str] = None,
     ) -> None:
         self._shelf_path = self._resolve_path(location)
+        self._strategy = eviction_strategy or "least_recently_updated"
         self._max_size = max_size if isinstance(max_size, int) else None
 
-        if self._shelf_path.is_dir() or not self._shelf_path.suffix:
-            self._shelf_path /= "perscache.shelf"
-            self._shelf_path.parent.mkdir(
-                mode=0o755,
-                parents=True,
-                exist_ok=True,
+        if self._shelf_path.is_dir():
+            self._shelf_path /= "perscache"
+
+        if self._shelf_path.suffix:
+            shelf_path = reduce(
+                lambda value, suffix: value.replace(suffix, ""),
+                self._shelf_path.suffixes,
+                str(self._shelf_path),
             )
+            self._shelf_path = Path(shelf_path)
+
+        if always_fresh:
+            self.shelf_path.unlink(missing_ok=True)
+
+    def __repr__(self) -> str:
+        cls_name = self.__class__.__name__
+
+        try:
+            size = round(self.size / 1024, 4)
+        except FileNotFoundError:
+            size = 0
+
+        return f"<{cls_name}(size={size}mb, shelf={self.shelf_path})>"
 
     @property
     def _shelf(self) -> shelve.Shelf:
         """The instance's storage shelf."""
         return shelve.open(
-            str(self._shelf_path),
             flag="c",
             writeback=False,
             protocol=pickle.HIGHEST_PROTOCOL,
+            filename=cast(str, self._shelf_path),
         )
+
+    @memoized_property
+    def shelf_path(self) -> Path:
+        """The on-disk path to the storage shelf."""
+        with self._shelf as shelf:
+            if not shelf.keys():
+                shelf["_"] = None
+
+        shelf_name = self._shelf_path.stem
+        path: Optional[Path] = next(self._shelf_path.parent.glob(f"{shelf_name}.*"), None)
+
+        if not Path:
+            raise ValueError(f"No shelve file found for: {self._shelf_path}")
+
+        return path
+
+    @property
+    def size(self) -> int:
+        """The shelf's on-disk size."""
+        return self.shelf_path.stat().st_size
 
     def read(
         self,
@@ -174,6 +218,9 @@ class ShelvedStorage(Storage):
 
     def write(self, path: PathLike, data: bytes) -> None:
         """Shelve the given data under the given path."""
+        if self._max_size and self.size + len(data) >= self._max_size:
+            self.shrink(target_size=self._max_size)
+
         with self._shelf as shelf:
             record = shelf.get(path)
 
@@ -189,6 +236,33 @@ class ShelvedStorage(Storage):
                 created_at,
                 self._timestamp(),
             )
+
+    def shrink(
+        self,
+        target_size: int,
+        strategy: Optional[str] = None,
+    ) -> None:
+        """Shrink the shelf by evicting cached records according to the
+        specified strategy until the target size is reached.
+
+        If no strategy is specified, least-recently-updated will be
+        used.
+        """
+        if not isinstance(target_size, int):
+            raise TypeError(target_size, type(target_size))
+
+        strategy = str(strategy or self._strategy).strip().casefold().replace("-", "_")
+
+        if strategy in ("lru", "least_recently_updated"):
+            while target_size <= self.size:
+                with self._shelf as shelf:
+                    evicted, _ = max(
+                        shelf.items(),
+                        key=lambda pair: sys.getsizeof(pair[1]),
+                    )
+                    del _, shelf[evicted]
+
+        raise NotImplementedError
 
 
 class FileStorage(Storage):
@@ -362,9 +436,7 @@ class GoogleCloudStorage(FileStorage):
         # Third-Party Imports
         import gcsfs
 
-        self.fs = (
-            gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
-        )
+        self.fs = gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
 
     def read_file(self, path: PathLike) -> bytes:
         with self.fs.open(str(path), "rb") as f:
