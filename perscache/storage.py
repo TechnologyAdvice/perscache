@@ -5,31 +5,56 @@ from __future__ import annotations
 
 # Standard Library Imports
 import datetime as dt
-import os
+import pickle
+import shelve
 import tempfile
 from abc import (
     ABC,
     abstractmethod,
 )
+from collections import namedtuple
+from functools import cache as memoize
 from pathlib import Path
 
 # Third-Party Imports
 from beartype import beartype
 from beartype.typing import (
-    Iterator,
+    Callable,
     Iterable,
+    Iterator,
     Optional,
     Union,
 )
 
 # Imports From Package Sub-Modules
-from .compatibility import (
-    PathLike,
-    SpooledTempFile,
+from .compatibility import PathLike
+
+CacheRecord = namedtuple(
+    "CacheRecord",
+    (
+        "key",
+        "data",
+        "created_at",
+        "updated_at",
+    ),
+    defaults=(None, None, None, None),
 )
+DefaultTempDir: Path = (Path(tempfile.gettempdir()) / "perscache").resolve()
 
 
-class CacheExpired(Exception):
+class CacheError(LookupError):
+    """Base exception type for cache errors."""
+
+    ...
+
+
+class CacheMiss(CacheError):
+    """Raised when a cache file / entry does not exist."""
+
+    ...
+
+
+class CacheExpired(CacheError):
     """Raised when a cache file / entry exists but is expired."""
 
     ...
@@ -38,12 +63,24 @@ class CacheExpired(Exception):
 class Storage(ABC):
     """Cache storage."""
 
+    _timestamp: Callable[[], dt.datetime]
+
+    _timestamp = staticmethod(
+        lambda: dt.datetime.utcnow().replace(
+            tzinfo=dt.timezone.utc,
+        )
+    )
+
     @abstractmethod
-    def read(self, path: PathLike, deadline: dt.datetime) -> bytes:
+    def read(
+        self,
+        path: PathLike,
+        deadline: Optional[dt.datetime] = None,
+    ) -> bytes:
         """Read the file at the given path and return its contents as bytes.
 
-        If the file does not exist, raise FileNotFoundError. If the file
-        is older than the given deadline, raise CacheExpired.
+        If the file does not exist, raise CacheMiss. If the file is
+        older than the given deadline, raise CacheExpired.
         """
         ...
 
@@ -51,6 +88,107 @@ class Storage(ABC):
     def write(self, path: PathLike, data: bytes) -> None:
         """Write the file at the given path."""
         ...
+
+    @staticmethod
+    @memoize
+    def _resolve_path(path: Optional[PathLike]) -> Path:
+        """Ensure the specified path points to a valid directory."""
+        path = Path(path or DefaultTempDir)
+
+        if not path.is_absolute():
+            path = DefaultTempDir / str(path)
+
+        target_path = path
+
+        if target_path.is_file() or target_path.suffix:
+            target_path = path.parent
+
+        target_path.mkdir(
+            mode=0o755,
+            parents=True,
+            exist_ok=True,
+        )
+
+        return path
+
+
+class ShelvedStorage(Storage):
+    """Cache storage backed by Python's stdlib `shelve` module."""
+
+    __slots__ = (
+        "_max_size",
+        "_shelf_path",
+    )
+
+    _max_size: Optional[int]
+    _shelf_path: Path
+
+    @beartype
+    def __init__(
+        self,
+        location: Optional[PathLike] = None,
+        max_size: Optional[int] = None,
+    ) -> None:
+        self._shelf_path = self._resolve_path(location)
+        self._max_size = max_size if isinstance(max_size, int) else None
+
+        if self._shelf_path.is_dir() or not self._shelf_path.suffix:
+            self._shelf_path /= "perscache.shelf"
+            self._shelf_path.parent.mkdir(
+                mode=0o755,
+                parents=True,
+                exist_ok=True,
+            )
+
+    @property
+    def _shelf(self) -> shelve.Shelf:
+        """The instance's storage shelf."""
+        return shelve.open(
+            str(self._shelf_path),
+            flag="c",
+            writeback=False,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    def read(
+        self,
+        path: PathLike,
+        deadline: Optional[dt.datetime] = None,
+    ) -> bytes:
+        """Retrieve the shelved data for the given "path" key and return its
+        contents as bytes.
+
+        If the key does not exist, raise CacheMiss. If the shelved data
+        is older than the given deadline, raise CacheExpired.
+        """
+        with self._shelf as shelf:
+            cached: Optional[CacheRecord] = shelf.get(path)
+
+        if not cached:
+            raise CacheMiss
+
+        if deadline and cached.updated_at <= deadline:
+            raise CacheExpired
+
+        return cached.data
+
+    def write(self, path: PathLike, data: bytes) -> None:
+        """Shelve the given data under the given path."""
+        with self._shelf as shelf:
+            record = shelf.get(path)
+
+            created_at = getattr(
+                record,
+                "created_at",
+                self._timestamp(),
+            )
+
+            shelf[path] = CacheRecord(
+                path,
+                data,
+                created_at,
+                self._timestamp(),
+            )
 
 
 class FileStorage(Storage):
@@ -60,14 +198,22 @@ class FileStorage(Storage):
         location: Optional[PathLike] = ".cache",
         max_size: Optional[int] = None,
     ):
-        self.location = Path(location)
         self.max_size = max_size
+        self.location = Path(location)
+        self.ensure_path(self.location)
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(location={self.location}, max_size={self.max_size})>"
 
-    def read(self, path: PathLike, deadline: dt.datetime) -> bytes:
+    def read(
+        self,
+        path: PathLike,
+        deadline: Optional[dt.datetime] = None,
+    ) -> bytes:
         final_path = self.location / path
+
+        if not final_path.exists():
+            final_path.touch(mode=0o755, exist_ok=True)
 
         if deadline is not None and self.mtime(final_path) < deadline:
             raise CacheExpired
@@ -203,90 +349,6 @@ class LocalFileStorage(FileStorage):
         path.unlink()
 
 
-class SpooledTempFileStorage(LocalFileStorage):
-    """Temporary storage that acts like it's backed by a spooled temporary
-    file."""
-
-    max_size: int
-    directory: PathLike
-    __spools__: dict[PathLike, SpooledTempFile]
-
-    @beartype
-    def __init__(
-        self,
-        max_size: Optional[int] = None,
-        directory: Optional[PathLike] = None,
-    ) -> None:
-        self.__spools__ = dict()
-        self.max_size = max_size or 5_000_000
-        self.directory = self._resolve_dir(directory)
-
-        super().__init__()
-
-    @staticmethod
-    def _resolve_dir(path: Optional[PathLike]) -> Path:
-        """Resolve the supplied path."""
-        path = Path(path or Path(tempfile.gettempdir()) / "perscache")
-
-        if path.is_file():
-            path = path.parent
-
-        path.mkdir(
-            mode=0o755,
-            parents=True,
-            exist_ok=True,
-        )
-
-        return path
-
-    def _spool_for(self, path: PathLike) -> SpooledTempFile:
-        """Get the corresponding "spool" for the specified "path"."""
-        spool = self.__spools__.get(path)
-
-        if not spool:
-            spool = self.__spools__[path] = SpooledTempFile(
-                max_size=self.max_size,
-                directory=self.directory,
-            )
-
-        return spool
-
-    def read_file(self, path: PathLike) -> bytes:
-        spool = self._spool_for(path=path)
-
-        data = spool.getvalue()
-
-        return data
-
-    def write_file(self, path: PathLike, data: bytes) -> None:
-        """Write the supplied data into the spooled cache."""
-        spool = self._spool_for(path=path)
-        spool.write(data=data)
-
-    def iterdir(self, path: PathLike) -> Iterable[SpooledTempFile]:
-        return self.__spools__.values()
-
-    def rmdir(self, path: PathLike) -> None:
-        spool = self.__spools__.pop(path, None)
-
-        if spool is not None:
-            spool.delete()
-
-    def mtime(self, path: PathLike) -> dt.datetime:
-        """Timestamp of the most recent content modification made to the specified `path`."""
-        return self._spool_for(path).mtime
-
-    def atime(self, path: PathLike) -> dt.datetime:
-        """Timestamp of the most recent access of the specified `path`."""
-        return self._spool_for(path).atime
-
-    def size(self, path: PathLike) -> int:
-        return self._spool_for(path).size()
-
-    def delete(self, path: PathLike) -> None:
-        return self._spool_for(path).delete()
-
-
 class GoogleCloudStorage(FileStorage):
     @beartype
     def __init__(
@@ -300,7 +362,9 @@ class GoogleCloudStorage(FileStorage):
         # Third-Party Imports
         import gcsfs
 
-        self.fs = gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
+        self.fs = (
+            gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
+        )
 
     def read_file(self, path: PathLike) -> bytes:
         with self.fs.open(str(path), "rb") as f:
