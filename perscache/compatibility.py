@@ -4,35 +4,29 @@
 from __future__ import annotations
 
 # Standard Library Imports
-import asyncio as aio
 import collections
 import datetime as dt
+import hashlib
+import inspect
 import os
 import re
-import inspect
-import hashlib
 from itertools import repeat
-from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from types import TracebackType
 
 # Third-Party Imports
 import cloudpickle
 import cloudpickle.compat
 import pandas as pd
 from beartype.typing import (
+    Any,
+    Awaitable,
+    Callable,
     Optional,
-    Self,
     Type,
     TypeVar,
-    Callable,
-    Awaitable,
-    Any,
 )
-from boltons.ioutils import SpooledBytesIO
 
 # Imports From Package Sub-Modules
-from ._logger import logger
 from .serializers import (
     CloudPickleSerializer,
     CSVSerializer,
@@ -52,9 +46,6 @@ __all__ = (
     "CachedCallable",
     "CachedFunction",
     "CachedAsyncCallable",
-    # Enhanced / 'Shim' Types
-    "AsyncCacheLock",
-    "SpooledTempFile",
     # Data Type Samples
     "EXCLUSIONS",
     "DATAFRAMES",
@@ -166,7 +157,7 @@ EXCLUSIONS = {
 
 # <editor-fold desc="# Type Definitions ...">
 
-Unset = TypeVar("Unset", bound=Type[ValueError])
+
 PathLike = TypeVar("Pathlike", str, Path, os.PathLike)
 
 CachedValue = TypeVar("CachedValue")
@@ -208,136 +199,3 @@ def key_hash(key: str) -> str:
 
 
 # </editor-fold desc="# Utility Functions ...">
-
-# <editor-fold desc="# Enhanced / 'Shim' Types ...">
-
-
-class SpooledTempFile(SpooledBytesIO):
-    """A spooled file-like-object w/ timestamped write operations.
-
-    More info:
-      https://boltons.readthedocs.io/en/latest/ioutils.html#spooled-temporary-files
-    """
-
-    __atime: Optional[dt.datetime]
-    __mtime: Optional[dt.datetime]
-    _timestamp: Callable[[], dt.datetime]
-
-    def __init__(
-        self,
-        max_size: Optional[int] = None,
-        directory: Optional[PathLike] = None,
-    ) -> None:
-        max_size = max_size or 5_000_000
-
-        super().__init__(max_size, directory)
-
-        stamp = self._timestamp()
-        self.__atime, self.__mtime = stamp, stamp
-
-    _timestamp = staticmethod(
-        lambda: dt.datetime.utcnow().replace(
-            tzinfo=dt.timezone.utc,
-        )
-    )
-
-    @property
-    def mtime(self) -> dt.datetime:
-        """Timestamp of the spool's most recent content modification."""
-        return self.__mtime
-
-    @property
-    def atime(self) -> dt.datetime:
-        """Timestamp of the spool was most recently read."""
-        return self.__atime
-
-    def size(self) -> int:
-        """The "file size" of the spool."""
-        return self.len
-
-    def read(self, count: int = -1) -> bytes:
-        """Read the specified number of bytes from the spool."""
-        self.__atime = self._timestamp()
-        return super().read(count)
-
-    def write(self, data: bytes) -> None:
-        """Write the specified data into the spool."""
-        super().write(data)
-        self.__mtime = self._timestamp()
-
-    def delete(self) -> None:
-        """Emulate deletion as though the spool was a file."""
-        self.truncate(0)
-        self.seek(0)
-
-    def readline(self, length: Optional[int] = None) -> bytes:
-        self.__atime = self._timestamp()
-        return super().readline(length)
-
-    def readlines(self, size_hint: int = 0) -> bytes:
-        self.__atime = self._timestamp()
-        return super().readlines(size_hint)
-
-
-class AsyncCacheLock(aio.Event, AbstractAsyncContextManager):
-    """A context-managed asyncio `Event` that functions as a simple lock for a
-    specific function/cache-key pair."""
-
-    __slots__ = ("_value",)
-
-    _value: bool | Type[Unset]
-    _fn_name: str
-    _cache_key: str
-
-    def __init__(self, fn_name: str, cache_key: str) -> None:
-        super().__init__()
-
-        self._value, self._fn_name, self._cache_key = (
-            Unset,
-            fn_name,
-            key_hash(cache_key),
-        )
-
-    def is_set(self) -> bool:
-        """Determine if the `Event`'s internal flag is currently set."""
-        return self._value is True
-
-    def is_unset(self) -> bool:
-        """Determine if the `Event`'s internal flag is currently (explicitly)
-        *not* set."""
-        return self._value in (False, None, Unset)
-
-    async def __aenter__(self) -> Self:
-        if self._value is Unset:
-            self.set()
-
-        if not self.is_set():
-            logger.debug(
-                f"Waiting for outstanding '{self._fn_name}' "  # no-reformat
-                f"cache lock for key: {self._cache_key}"  # no-reformat
-            )
-
-            await self.wait()
-
-            logger.debug(
-                f"Outstanding '{self._fn_name}' cache "  # no-reformat
-                f"lock released for key: {self._cache_key}"  # no-reformat
-            )
-
-        self.clear()
-
-        logger.debug(f"Cache lock claimed for '{self._fn_name}' for key: {self._cache_key}")
-
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: Type[Exception] | None,
-        error: Exception | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        self.set()
-        logger.debug(f"Cache lock released for '{self._fn_name}' for key: {self._cache_key}")
-
-
-# </editor-fold desc="# Compatibility / 'Shim' Types ...">
