@@ -37,7 +37,6 @@ python = ">=3.8.1,<3.12"
 
 # Core project dependencies
 beartype = ">=0.10.0"
-boltons = ">=23.0"
 cloudpickle = "*"
 icontract = "*"
 wrapt = "^1"
