@@ -242,17 +242,38 @@ class Cache:
         fn_sig = inspect.signature(fn)
         fn_args = fn_sig.bind(*args, **kwargs).arguments
         arg_dict = {
-            arg: value
+            arg: id(value) if value is instance else value
             for (
                 arg,
                 value,
             ) in fn_args.items()
-            if arg not in ignore and value not in (instance, WrappedInstance)
+            if arg not in ignore
         }
+
+        for kw_args in (
+            arg_dict.pop(key, dict())
+            for (
+                key,
+                param,
+            ) in fn_sig.parameters.items()
+            if param.kind.name == "VAR_KEYWORD"
+        ):
+            arg_dict.update(
+                **{
+                    key: value
+                    for (
+                        key,
+                        value,
+                    ) in kw_args.items()
+                    if key not in ignore
+                }
+            )
 
         fn_src, serializer_name = inspect.getsource(fn), type(serializer).__name__
 
-        return self.hash_func(fn_src, serializer_name, arg_dict)
+        hashed = self.hash_func(fn_src, serializer_name, arg_dict)
+
+        return hashed
 
     @staticmethod
     def _get_filename(fn: CachedFunction, key: str, serializer: Serializer) -> str:
