@@ -143,7 +143,6 @@ class Cache:
     def __call__(
         self,
         fn: Optional[CachedFunction] = None,
-        *,
         storage: Optional[Storage] = None,
         ttl: Optional[dt.timedelta] = None,
         ignore: Optional[Iterable[str]] = None,
@@ -304,8 +303,11 @@ class NoCache:
         """Will call the decorated function every time and return its result
         without any caching."""
 
-        def _decorator(fn: CachedFunction) -> CachedCallable | CachedAsyncCallable:
-            return self._async_wrapper if is_async(fn) else self._wrapper
+        def _decorator(fn: CachedFunction, *args: Any, **kwargs: Any) -> CachedCallable | CachedAsyncCallable:
+            wrapper = self._async_wrapper if is_async(fn) else self._wrapper
+            wrapped = wrapper(fn, *args, **kwargs)
+
+            return wrapped
 
         return _decorator
 
