@@ -152,7 +152,10 @@ class ShelvedStorage(Storage):
             self._shelf_path = Path(shelf_path)
 
         if always_fresh:
-            self.shelf_path.unlink(missing_ok=True)
+            try:
+                self.shelf_path.unlink(missing_ok=True)
+            except (AttributeError, FileNotFoundError):
+                pass
 
     def __repr__(self) -> str:
         cls_name = self.__class__.__name__
@@ -178,16 +181,18 @@ class ShelvedStorage(Storage):
     def shelf_path(self) -> Path:
         """The on-disk path to the storage shelf."""
         with self._shelf as shelf:
-            if not shelf.keys():
-                shelf["_"] = None
+            shelf["_"] = None
 
         shelf_name = self._shelf_path.stem
-        path: Optional[Path] = next(self._shelf_path.parent.glob(f"{shelf_name}.*"), None)
+        shelf_path: Optional[Path] = next(
+            self._shelf_path.parent.rglob(f"**/{shelf_name}.*"),
+            None,
+        )
 
-        if not Path:
-            raise ValueError(f"No shelve file found for: {self._shelf_path}")
+        if not shelf_path:
+            raise FileNotFoundError(f"No shelve file found for: {self._shelf_path}")
 
-        return path
+        return shelf_path
 
     @property
     def size(self) -> int:
@@ -436,7 +441,9 @@ class GoogleCloudStorage(FileStorage):
         # Third-Party Imports
         import gcsfs
 
-        self.fs = gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
+        self.fs = (
+            gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
+        )
 
     def read_file(self, path: PathLike) -> bytes:
         with self.fs.open(str(path), "rb") as f:
