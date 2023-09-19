@@ -16,9 +16,9 @@ from abc import (
 from collections import namedtuple
 from functools import (
     cache as memoize,
-    cached_property as memoized_property,
     reduce,
 )
+from itertools import chain
 from pathlib import Path
 
 # Third-Party Imports
@@ -122,11 +122,13 @@ class ShelvedStorage(Storage):
         "_max_size",
         "_strategy",
         "_shelf_path",
+        "__resolved_shelf",
     )
 
     _max_size: Optional[int]
     _strategy: str
     _shelf_path: Path
+    __resolved_shelf: Optional[Path]
 
     @beartype
     def __init__(
@@ -139,6 +141,7 @@ class ShelvedStorage(Storage):
         self._shelf_path = self._resolve_path(location)
         self._strategy = eviction_strategy or "least_recently_updated"
         self._max_size = max_size if isinstance(max_size, int) else None
+        self.__resolved_shelf = None
 
         if self._shelf_path.is_dir():
             self._shelf_path /= "perscache"
@@ -177,17 +180,21 @@ class ShelvedStorage(Storage):
             filename=cast(str, self._shelf_path),
         )
 
-    @memoized_property
+    @property
     def shelf_path(self) -> Path:
         """The on-disk path to the storage shelf."""
+        if self.__resolved_shelf:
+            return self.__resolved_shelf
+
         with self._shelf as shelf:
-            shelf["_"] = None
+            shelf[f"shelf_{hex(id(self))[2:]}"] = str(self._shelf_path)
 
         shelf_name = self._shelf_path.stem
-        shelf_path: Optional[Path] = next(
+        globbed = chain(
             self._shelf_path.parent.rglob(f"**/{shelf_name}.*"),
-            None,
+            self._shelf_path.parent.rglob(f"**/{shelf_name}"),
         )
+        shelf_path = self.__resolved_shelf = next(filter(Path.is_file, globbed), None)
 
         if not shelf_path:
             raise FileNotFoundError(f"No shelve file found for: {self._shelf_path}")
@@ -441,9 +448,7 @@ class GoogleCloudStorage(FileStorage):
         # Third-Party Imports
         import gcsfs
 
-        self.fs = (
-            gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
-        )
+        self.fs = gcsfs.GCSFileSystem(**storage_options) if storage_options else gcsfs.GCSFileSystem()
 
     def read_file(self, path: PathLike) -> bytes:
         with self.fs.open(str(path), "rb") as f:
