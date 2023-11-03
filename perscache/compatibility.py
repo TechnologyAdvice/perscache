@@ -15,14 +15,12 @@ from pathlib import Path
 
 # Third-Party Imports
 import cloudpickle
-import cloudpickle.compat
 import pandas as pd
 from beartype.typing import (
     Any,
     Awaitable,
     Callable,
     Optional,
-    Type,
     TypeVar,
 )
 
@@ -35,6 +33,23 @@ from .serializers import (
     PickleSerializer,
     YAMLSerializer,
 )
+
+try:
+    import cloudpickle.compat as _
+
+    PicklingError = cloudpickle.compat.pickle.PicklingError
+except (ImportError, ModuleNotFoundError):
+    try:
+        import cloudpickle.cloudpickle as _
+
+        PicklingError = cloudpickle.cloudpickle.pickle.PicklingError
+    except (ImportError, ModuleNotFoundError):
+        import pickle as _
+
+        PicklingError = _.PicklingError
+finally:
+    del _
+
 
 __all__ = (
     # Utility Functions
@@ -59,8 +74,6 @@ md5_pattern: re.Pattern = re.compile(
     r"\W(?P<hash>[0-9a-f]{32})\W",
     flags=re.I,
 )
-
-PicklingError = cloudpickle.compat.pickle.PicklingError
 
 # </editor-fold desc="# Constants ...">
 
